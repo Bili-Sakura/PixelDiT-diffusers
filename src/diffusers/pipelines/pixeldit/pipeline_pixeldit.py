@@ -20,56 +20,32 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
-
-from diffusers.image_processor import VaeImageProcessor
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline, ImagePipelineOutput
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler
 from diffusers.utils.torch_utils import randn_tensor
 
 from ...models.transformers.transformer_pixeldit import PixelDiTTransformer2DModel
 
-DEFAULT_NATIVE_RESOLUTION = 256
+RECOMMENDED_GUIDANCE_BY_SIZE = {
+    256: 3.25,
+    512: 3.75,
+}
 
-EXAMPLE_DOC_STRING = """
-    Examples:
-        ```py
-        >>> from pathlib import Path
-        >>> from diffusers import DiffusionPipeline
-        >>> import torch
-
-        >>> model_dir = Path("./PixelDiT-XL").resolve()
-        >>> pipe = DiffusionPipeline.from_pretrained(
-        ...     str(model_dir),
-        ...     local_files_only=True,
-        ...     custom_pipeline=str(model_dir / "pipeline.py"),
-        ...     trust_remote_code=True,
-        ...     torch_dtype=torch.bfloat16,
-        ... )
-        >>> pipe.to("cuda")
-
-        >>> generator = torch.Generator(device="cuda").manual_seed(42)
-        >>> image = pipe(
-        ...     class_labels=207,
-        ...     height=256,
-        ...     width=256,
-        ...     num_inference_steps=100,
-        ...     guidance_scale=3.25,
-        ...     guidance_interval=(0.1, 1.0),
-        ...     generator=generator,
-        ... ).images[0]
-        ```
-"""
+RECOMMENDED_SCHEDULER_SHIFT_BY_SIZE = {
+    256: 1.0,
+    512: 3.0,
+}
 
 
 class PixelDiTPipeline(DiffusionPipeline):
     r"""
-    Pipeline for PixelDiT class-conditional image generation.
+    Pipeline for image generation using PixelDiT (Pixel Diffusion Transformer).
 
     Parameters:
         transformer ([`PixelDiTTransformer2DModel`]):
-            Class-conditional PixelDiT transformer that predicts flow-matching velocity in pixel space.
-        scheduler ([`FlowMatchEulerDiscreteScheduler`]):
-            Flow-matching Euler scheduler used for inference.
+            A class-conditioned `PixelDiTTransformer2DModel` that predicts flow-matching velocity in pixel space.
+        scheduler ([`KarrasDiffusionSchedulers`] or [`FlowMatchEulerDiscreteScheduler`]):
+            Diffusers scheduler interface for PixelDiT generation (defaults to deterministic flow-matching Euler).
         id2label (`dict[int, str]`, *optional*):
             ImageNet class id to English label mapping. Values may contain comma-separated synonyms.
     """
@@ -97,8 +73,12 @@ class PixelDiTPipeline(DiffusionPipeline):
         id2label: Optional[Dict[Union[int, str], str]] = None,
     ):
         super().__init__()
+        scheduler = scheduler or FlowMatchEulerDiscreteScheduler(
+            num_train_timesteps=1000,
+            shift=1.0,
+            stochastic_sampling=False,
+        )
         self.register_modules(transformer=transformer, scheduler=scheduler)
-        self.image_processor = VaeImageProcessor()
         self._id2label = self._normalize_id2label(id2label)
         self.labels = self._build_label2id(self._id2label)
         self._labels_loaded_from_model_index = bool(self._id2label)
@@ -136,6 +116,7 @@ class PixelDiTPipeline(DiffusionPipeline):
                     num_train_timesteps=1000,
                     shift=1.0,
                     stochastic_sampling=False,
+                    **scheduler_kwargs,
                 )
 
             id2label = cls._read_id2label_from_model_index(str(base_path))
@@ -186,22 +167,16 @@ class PixelDiTPipeline(DiffusionPipeline):
 
     @property
     def id2label(self) -> Dict[int, str]:
-        r"""ImageNet class id to English label string (comma-separated synonyms)."""
         self._ensure_labels_loaded()
         return self._id2label
 
     def get_label_ids(self, label: Union[str, List[str]]) -> List[int]:
-        r"""
-        Map ImageNet label strings to class ids.
-
-        Args:
-            label (`str` or `list[str]`):
-                One or more English label strings. Each string must match a synonym in `id2label`.
-        """
         self._ensure_labels_loaded()
         label2id = self.labels
         if not label2id:
-            raise ValueError("No English labels loaded. Ensure `id2label` exists in model_index.json.")
+            raise ValueError(
+                "No English labels loaded. Ensure `id2label` exists in model_index.json."
+            )
 
         if isinstance(label, str):
             label = [label]
@@ -214,149 +189,151 @@ class PixelDiTPipeline(DiffusionPipeline):
 
     def _normalize_class_labels(
         self,
-        class_labels: Union[int, str, List[Union[int, str]], torch.LongTensor],
-    ) -> torch.LongTensor:
-        if torch.is_tensor(class_labels):
-            return class_labels.to(device=self._execution_device, dtype=torch.long).reshape(-1)
-
+        class_labels: Union[int, str, List[Union[int, str]]],
+    ) -> List[int]:
         if isinstance(class_labels, int):
-            class_label_ids = [class_labels]
-        elif isinstance(class_labels, str):
-            class_label_ids = self.get_label_ids(class_labels)
-        elif class_labels and isinstance(class_labels[0], str):
-            class_label_ids = self.get_label_ids(class_labels)
-        else:
-            class_label_ids = list(class_labels)
+            return [class_labels]
 
-        return torch.tensor(class_label_ids, device=self._execution_device, dtype=torch.long).reshape(-1)
+        if isinstance(class_labels, str):
+            return self.get_label_ids(class_labels)
 
-    def check_inputs(
-        self,
-        height: int,
-        width: int,
+        if class_labels and isinstance(class_labels[0], str):
+            return self.get_label_ids(class_labels)
+
+        return list(class_labels)
+
+    @staticmethod
+    def _resolve_timeshift(scheduler, image_size: int) -> float:
+        shift = getattr(scheduler.config, "shift", None)
+        if shift is not None:
+            return float(shift)
+        return RECOMMENDED_SCHEDULER_SHIFT_BY_SIZE.get(image_size, 1.0)
+
+    @staticmethod
+    def _build_flow_timesteps(
         num_inference_steps: int,
-        output_type: str,
-    ) -> None:
-        if num_inference_steps < 1:
-            raise ValueError("num_inference_steps must be >= 1.")
-        if output_type not in {"pil", "np", "pt", "latent"}:
-            raise ValueError("output_type must be one of: 'pil', 'np', 'pt', 'latent'.")
-        patch_size = int(self.transformer.config.patch_size)
-        if height % patch_size != 0 or width % patch_size != 0:
-            raise ValueError("height and width must be divisible by the transformer's patch_size.")
-
-    def prepare_latents(
-        self,
-        batch_size: int,
-        height: int,
-        width: int,
-        dtype: torch.dtype,
+        timeshift: float,
         device: torch.device,
-        generator: Optional[Union[torch.Generator, List[torch.Generator]]],
+        dtype: torch.dtype,
     ) -> torch.Tensor:
-        shape = (batch_size, self.transformer.config.in_channels, height, width)
-        return randn_tensor(shape, generator=generator, device=device, dtype=dtype)
+        last_step = 1.0 / num_inference_steps if num_inference_steps > 1 else 1.0
+        timesteps = torch.linspace(0.0, 1.0 - last_step, num_inference_steps, device=device, dtype=dtype)
+        timesteps = torch.cat([timesteps, torch.ones(1, device=device, dtype=dtype)], dim=0)
+        if timeshift != 1.0:
+            timesteps = timesteps / (timesteps + (1.0 - timesteps) * timeshift)
+        return timesteps
 
-    def _apply_classifier_free_guidance(
-        self,
-        model_output: torch.Tensor,
-        guidance_scale: float,
-        guidance_active: bool,
-    ) -> torch.Tensor:
-        if guidance_scale <= 1.0 or not guidance_active:
-            return model_output
-        model_output_cond, model_output_uncond = model_output.chunk(2)
+    @staticmethod
+    def _apply_classifier_free_guidance(model_output: torch.Tensor, guidance_scale: float) -> torch.Tensor:
+        model_output_uncond, model_output_cond = model_output.chunk(2, dim=0)
         return model_output_uncond + guidance_scale * (model_output_cond - model_output_uncond)
-
-    def decode_latents(self, latents: torch.Tensor, output_type: str = "pil"):
-        if output_type == "latent":
-            return latents
-        return self.image_processor.postprocess(latents, output_type=output_type)
 
     @torch.inference_mode()
     def __call__(
         self,
-        class_labels: Union[int, str, List[Union[int, str]], torch.LongTensor],
+        class_labels: Union[int, str, List[Union[int, str]]],
+        guidance_scale: Optional[float] = None,
+        guidance_interval_min: float = 0.0,
+        guidance_interval_max: float = 1.0,
+        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
+        num_inference_steps: int = 50,
         height: Optional[int] = None,
         width: Optional[int] = None,
-        num_inference_steps: int = 50,
-        guidance_scale: float = 1.0,
-        guidance_interval: Tuple[float, float] = (0.0, 1.0),
-        generator: Optional[Union[torch.Generator, List[torch.Generator]]] = None,
-        output_type: str = "pil",
+        output_type: Optional[str] = "pil",
         return_dict: bool = True,
     ) -> Union[ImagePipelineOutput, Tuple]:
-        r"""
-        Generate class-conditional images with PixelDiT.
+        if num_inference_steps < 1:
+            raise ValueError("num_inference_steps must be >= 1.")
+        if output_type not in {"pil", "np", "pt"}:
+            raise ValueError("output_type must be one of: 'pil', 'np', 'pt'.")
 
-        Args:
-            class_labels (`int`, `str`, `list[int]`, `list[str]`, or `torch.LongTensor`):
-                ImageNet class indices or human-readable English label strings.
-            height (`int`, *optional*):
-                Output image height in pixels. Defaults to `256`.
-            width (`int`, *optional*):
-                Output image width in pixels. Defaults to `256`.
-            num_inference_steps (`int`, defaults to `50`):
-                Number of denoising steps.
-            guidance_scale (`float`, defaults to `1.0`):
-                Classifier-free guidance scale. CFG is active when `guidance_scale > 1.0`.
-            guidance_interval (`tuple[float, float]`, defaults to `(0.0, 1.0)`):
-                Flow-time interval where CFG is applied.
-            generator (`torch.Generator`, *optional*):
-                RNG for reproducibility.
-            output_type (`str`, defaults to `"pil"`):
-                `"pil"`, `"np"`, `"pt"`, or `"latent"`.
-            return_dict (`bool`, defaults to `True`):
-                Return [`ImagePipelineOutput`] if True.
-        """
-        height = int(height or DEFAULT_NATIVE_RESOLUTION)
-        width = int(width or DEFAULT_NATIVE_RESOLUTION)
-        self.check_inputs(height, width, num_inference_steps, output_type)
+        class_label_ids = self._normalize_class_labels(class_labels)
+        do_classifier_free_guidance = guidance_scale is not None and guidance_scale > 1.0
 
-        device = self._execution_device
-        model_dtype = next(self.transformer.parameters()).dtype
-        class_labels_tensor = self._normalize_class_labels(class_labels)
-        batch_size = class_labels_tensor.numel()
-
-        latents = self.prepare_latents(batch_size, height, width, model_dtype, device, generator)
-        self.scheduler.set_timesteps(num_inference_steps, device=device)
-        extra_step_kwargs = self.prepare_extra_step_kwargs(self.scheduler, generator=generator)
-        num_train_timesteps = self.scheduler.config.num_train_timesteps
-
-        if getattr(self.scheduler.config, "stochastic_sampling", False):
+        batch_size = len(class_label_ids)
+        image_size = int(getattr(self.transformer.config, "sample_size", 256))
+        patch_size = int(self.transformer.config.patch_size)
+        height = int(height or image_size)
+        width = int(width or image_size)
+        if height <= 0 or width <= 0:
+            raise ValueError("height and width must be positive integers.")
+        if height % patch_size != 0 or width % patch_size != 0:
             raise ValueError(
-                "PixelDiT expects deterministic FlowMatchEulerDiscreteScheduler stepping "
-                "(scheduler.config.stochastic_sampling=False)."
+                f"height and width must be divisible by patch_size={patch_size}. Got {(height, width)}."
+            )
+        channels = int(self.transformer.config.in_channels)
+        null_class_val = int(
+            getattr(self.transformer.config, "num_classes", getattr(self.transformer.config, "num_class_embeds", 1000))
+        )
+
+        if guidance_scale is None:
+            guidance_scale = RECOMMENDED_GUIDANCE_BY_SIZE.get(image_size, 3.25)
+
+        latents = randn_tensor(
+            shape=(batch_size, channels, height, width),
+            generator=generator,
+            device=self._execution_device,
+            dtype=self.transformer.dtype,
+        )
+
+        class_labels_t = torch.tensor(class_label_ids, device=self._execution_device, dtype=torch.long).reshape(-1)
+        class_labels_t = class_labels_t.clamp(0, null_class_val - 1)
+        class_null = torch.full_like(class_labels_t, null_class_val)
+
+        timeshift = self._resolve_timeshift(self.scheduler, image_size)
+        flow_timesteps = self._build_flow_timesteps(
+            num_inference_steps,
+            timeshift,
+            device=self._execution_device,
+            dtype=torch.float32,
+        )
+        velocity_dtype = self.transformer.dtype
+        v_prev = None
+
+        for t_cur, t_next in self.progress_bar(list(zip(flow_timesteps[:-1], flow_timesteps[1:]))):
+            dt = t_next - t_cur
+            flow_time = float(t_cur)
+            effective_guidance = (
+                guidance_scale
+                if do_classifier_free_guidance
+                and guidance_interval_min < flow_time < guidance_interval_max
+                else 1.0
             )
 
-        null_labels = torch.full_like(class_labels_tensor, self.transformer.config.num_classes)
-        guidance_low, guidance_high = guidance_interval
-
-        for t in self.progress_bar(self.scheduler.timesteps):
-            flow_time = float(t) / num_train_timesteps
-            guidance_active = guidance_low <= flow_time <= guidance_high
-            if guidance_scale > 1.0 and guidance_active:
-                model_input = torch.cat([latents, latents], dim=0)
-                labels = torch.cat([class_labels_tensor, null_labels], dim=0)
-            else:
-                model_input = latents
-                labels = class_labels_tensor
-
-            timestep_batch = torch.full((labels.numel(),), flow_time, device=device, dtype=model_dtype)
+            latent_model_input = torch.cat([latents, latents], dim=0)
+            labels = torch.cat([class_null, class_labels_t], dim=0)
+            timesteps = torch.full(
+                (latent_model_input.shape[0],),
+                flow_time,
+                device=self._execution_device,
+                dtype=velocity_dtype,
+            )
             model_output = self.transformer(
-                model_input.to(dtype=model_dtype),
-                timestep_batch,
-                labels,
-                return_dict=True,
+                latent_model_input,
+                timestep=timesteps,
+                class_labels=labels,
             ).sample
-            model_output = self._apply_classifier_free_guidance(model_output, guidance_scale, guidance_active)
-            latents = self.scheduler.step(model_output, t, latents, **extra_step_kwargs).prev_sample
+            velocity = self._apply_classifier_free_guidance(model_output, effective_guidance)
 
-        image = self.decode_latents(latents, output_type=output_type)
+            if v_prev is None:
+                latents = latents + velocity * dt
+            else:
+                latents = latents + dt * (1.5 * velocity - 0.5 * v_prev)
+            v_prev = velocity
+
+        images_pt = ((latents.float().clamp(-1, 1) + 1.0) / 2.0).cpu()
+        if output_type == "pt":
+            images = images_pt
+        elif output_type == "np":
+            images = images_pt.permute(0, 2, 3, 1).numpy()
+        else:
+            images = self.numpy_to_pil(images_pt.permute(0, 2, 3, 1).numpy())
+
         self.maybe_free_model_hooks()
+
         if not return_dict:
-            return (image,)
-        return ImagePipelineOutput(images=image)
+            return (images,)
+        return ImagePipelineOutput(images=images)
 
 
 PixelDiTPipelineOutput = ImagePipelineOutput

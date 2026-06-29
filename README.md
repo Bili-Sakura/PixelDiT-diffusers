@@ -1,25 +1,17 @@
-<p align="center">
-  <img src="assets/pixeldit-logo.png" height="120" />
-</p>
+# PixelDiT Diffusers Refactor
 
-<h2 align="center">PixelDiT Diffusers Integration</h2>
+This repository is fully organized around a Diffusers-style package layout, following the same migration pattern used in `JiT-diffusers` and `NiT-diffusers`.
 
-This repository contains a Diffusers-style implementation of PixelDiT. The legacy
-standalone training, preprocessing, and YAML config codepaths have been removed
-so the remaining tree mirrors the package boundaries used by `huggingface/diffusers`.
+Legacy standalone training/evaluation codepaths have been removed so the tree is focused on reusable Diffusers components and checkpoint conversion.
 
 ## Package layout
 
-- `src/diffusers/models/transformers/transformer_pixeldit.py`:
-  `PixelDiTTransformer2DModel`, a `ModelMixin`/`ConfigMixin` class-conditional
-  PixelDiT transformer.
-- `src/diffusers/pipelines/pixeldit/pipeline_pixeldit.py`:
-  `PixelDiTPipeline`, a Diffusers pipeline with classifier-free guidance for
-  native-resolution pixel-space sampling.
-- `scripts/convert_pixeldit_to_diffusers.py`:
-  converts original PixelDiT checkpoints to a Diffusers pipeline directory.
-- `scripts/sample_pixeldit.py`:
-  samples from a converted pipeline.
+- `src/diffusers/models/transformers/transformer_pixeldit.py`: `PixelDiTTransformer2DModel` (`ModelMixin`/`ConfigMixin`) class-conditional transformer, presets, and legacy state-dict remapping.
+- `scheduler/scheduler_config.json`: use built-in `FlowMatchEulerDiscreteScheduler` with deterministic flow matching.
+- `src/diffusers/pipelines/pixeldit/pipeline_pixeldit.py`: `PixelDiTPipeline` with classifier-free guidance and dynamic `height`/`width` inference.
+- `scripts/convert_pixeldit_to_diffusers.py`: converts legacy PixelDiT checkpoints to Diffusers model directories.
+- `scripts/convert_diffusers_to_pixeldit.py`: converts Diffusers PixelDiT models back to legacy checkpoint format.
+- `scripts/sample_pixeldit.py`: batch image sampling script for converted models.
 
 ## Convert a checkpoint
 
@@ -27,12 +19,19 @@ so the remaining tree mirrors the package boundaries used by `huggingface/diffus
 python scripts/convert_pixeldit_to_diffusers.py \
   --checkpoint checkpoints/pixeldit_xl_1600k.safetensors \
   --output pixeldit-xl-diffusers \
-  --model-size pixeldit-xl
+  --model-size pixeldit-xl \
+  --check-load
 ```
 
-The converted directory contains `model_index.json`, transformer weights and
-config, and scheduler config. Use `--id2label` to embed ImageNet class names in
-`model_index.json` if desired.
+The generated `conversion_metadata.json` includes Diffusers-style fields for round-trip conversion.
+
+## Convert back to legacy checkpoint
+
+```bash
+python scripts/convert_diffusers_to_pixeldit.py \
+  --model_path pixeldit-xl-diffusers \
+  --output_path checkpoint-converted.safetensors
+```
 
 ## Sample
 
@@ -44,16 +43,31 @@ python scripts/sample_pixeldit.py \
   --width 256 \
   --num-inference-steps 100 \
   --guidance-scale 3.25 \
-  --guidance-low 0.1 \
-  --guidance-high 1.0
+  --guidance-interval-min 0.1 \
+  --guidance-interval-max 1.0
 ```
 
-## Upstreaming to Diffusers
+You can run inference at any resolution divisible by the model patch size by passing `height` and `width` to pipeline `__call__`.
 
-Copy the files under `src/diffusers` into the matching locations in the
-`huggingface/diffusers` repository and add the classes to Diffusers' lazy import
-registries. The module names and save/load artifacts are already aligned with
-Diffusers package conventions.
+## Load from a Hub bundle
+
+```python
+from diffusers import DiffusionPipeline
+import torch
+
+pipe = DiffusionPipeline.from_pretrained(
+    "UserID/PixelDiT-diffusers",
+    trust_remote_code=True,
+    torch_dtype=torch.bfloat16,
+)
+pipe.to("cuda")
+image = pipe(class_labels=207, guidance_scale=3.25).images[0]
+```
+
+## Notes
+
+- This repository is intended for Diffusers integration and checkpoint conversion workflows.
+- For direct upstreaming, copy files under `src/diffusers` into matching paths in `huggingface/diffusers` and register lazy imports there.
 
 ## Citation
 

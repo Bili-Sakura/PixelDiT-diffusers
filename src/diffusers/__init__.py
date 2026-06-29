@@ -1,4 +1,9 @@
-from .models.transformers import PixelDiTTransformer2DModel
-from .pipelines.pixeldit import PixelDiTPipeline, PixelDiTPipelineOutput
+from .models.transformers.transformer_pixeldit import PixelDiTDiffusersModel, PixelDiTTransformer2DModel
+from .pipelines.pixeldit.pipeline_pixeldit import PixelDiTPipeline, PixelDiTPipelineOutput
 
-__all__ = ["PixelDiTPipeline", "PixelDiTPipelineOutput", "PixelDiTTransformer2DModel"]
+__all__ = [
+    "PixelDiTTransformer2DModel",
+    "PixelDiTDiffusersModel",
+    "PixelDiTPipeline",
+    "PixelDiTPipelineOutput",
+]

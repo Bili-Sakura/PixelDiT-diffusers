@@ -1,11 +1,16 @@
 #!/usr/bin/env python3
 
 import argparse
+import sys
 from pathlib import Path
 
 import torch
 
-from diffusers import PixelDiTPipeline
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from src.diffusers.pipelines.pixeldit.pipeline_pixeldit import PixelDiTPipeline
 
 
 def parse_args():
@@ -16,8 +21,8 @@ def parse_args():
     parser.add_argument("--width", type=int, default=256)
     parser.add_argument("--num-inference-steps", type=int, default=50)
     parser.add_argument("--guidance-scale", type=float, default=1.0)
-    parser.add_argument("--guidance-low", type=float, default=0.0)
-    parser.add_argument("--guidance-high", type=float, default=1.0)
+    parser.add_argument("--guidance-interval-min", type=float, default=0.0)
+    parser.add_argument("--guidance-interval-max", type=float, default=1.0)
     parser.add_argument("--torch-dtype", choices=["float32", "float16", "bfloat16"], default="bfloat16")
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--seed", type=int, default=None)
@@ -44,7 +49,8 @@ def main():
         width=args.width,
         num_inference_steps=args.num_inference_steps,
         guidance_scale=args.guidance_scale,
-        guidance_interval=(args.guidance_low, args.guidance_high),
+        guidance_interval_min=args.guidance_interval_min,
+        guidance_interval_max=args.guidance_interval_max,
         generator=generator,
     )
 
